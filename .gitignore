@@ -3,6 +3,11 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# others
+csv
+plots
+temp.md 
+
 # C extensions
 *.so
 

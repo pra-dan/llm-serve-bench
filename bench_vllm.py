@@ -7,8 +7,10 @@ Usage:
 import argparse
 import asyncio
 import csv
+import os
 import statistics
 import time
+from datetime import datetime, timezone
 
 from openai import AsyncOpenAI
 
@@ -103,6 +105,8 @@ async def bench_concurrency(client, model, prompt, max_tokens, concurrency, roun
 
     summary = {
         "concurrency": concurrency,
+        "n_requests": len(all_results),
+        "n_ttft_samples": len(ttfts),
         "ttft_p50": percentile(ttfts, 50),
         "ttft_p90": percentile(ttfts, 90),
         "ttft_p99": percentile(ttfts, 99),
@@ -133,7 +137,8 @@ def print_summary_table(summaries):
 
 
 def write_csv(path, all_rows):
-    fieldnames = ["concurrency", "round", "ttft", "mean_itl", "completion_tokens", "total_time", "tokens_per_sec"]
+    fieldnames = ["run_id", "label", "concurrency", "round", "ttft", "mean_itl",
+                  "completion_tokens", "total_time", "tokens_per_sec"]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -141,7 +146,67 @@ def write_csv(path, all_rows):
             writer.writerow(row)
 
 
+SUMMARY_FIELDS = [
+    "run_id", "timestamp", "label", "model",
+    "max_num_seqs", "max_num_batched_tokens", "prefix_caching",
+    "rounds", "warmup_rounds", "max_tokens",
+    "concurrency", "n_requests", "n_ttft_samples",
+    "ttft_p50", "ttft_p90", "ttft_p99",
+    "itl_p50", "itl_p90", "itl_p99",
+    "req_tps_mean", "aggregate_tps",
+]
+
+
+def append_summary_csv(path, rows):
+    """Append one summary row per concurrency level, accumulating across runs.
+
+    A sweep restarts the server per config, so each config is a separate process
+    and cannot hold the results of the others. Appending here is what lets a
+    sweep end up in one file; `label` and the knob columns are what make the
+    rows distinguishable once they are all in it.
+    """
+    existing = os.path.exists(path) and os.path.getsize(path) > 0
+    if existing:
+        with open(path, newline="") as f:
+            header = next(csv.reader(f), [])
+        if header != SUMMARY_FIELDS:
+            raise SystemExit(
+                f"{path} has columns {header}, expected {SUMMARY_FIELDS}.\n"
+                "Appending would misalign it. Move the old file aside or pass "
+                "a different --summary-csv."
+            )
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS)
+        if not existing:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _silence_asyncgen_teardown_noise():
+    """Drop the httpcore2 pool-teardown traceback that buries the summary table.
+
+    On Python 3.14 + httpcore2, asyncio.run()'s final shutdown_asyncgens() races
+    the connection pool's PoolByteStream.__aiter__ generator and reports
+    "RuntimeError: generator didn't stop after athrow()" via the loop exception
+    handler. It fires after all results are collected (exit status stays 0) and
+    is intermittent -- roughly 6 runs in 10 here. Closing the client or wrapping
+    each stream in `async with` does not prevent it; both were measured.
+
+    Only asyncgen-finalisation reports are dropped. Real failures propagate out
+    of main() untouched.
+    """
+
+    def handler(loop, context):
+        if "asynchronous generator" in context.get("message", ""):
+            return
+        loop.default_exception_handler(context)
+
+    asyncio.get_running_loop().set_exception_handler(handler)
+
+
 async def main():
+    _silence_asyncgen_teardown_noise()
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
     parser.add_argument("--api-key", default="dummy")
@@ -152,7 +217,25 @@ async def main():
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--prompt-file", default=None)
     parser.add_argument("--output-csv", default="results.csv")
+    parser.add_argument("--summary-csv", default="summary.csv",
+                        help="Per-concurrency summary rows, appended across runs.")
+    parser.add_argument("--label", default="",
+                        help="Config tag for this run, e.g. 'seqs64'. Distinguishes "
+                             "sweep rows in --summary-csv.")
+    # Recorded, not applied: these must match how the server was actually
+    # launched. The sweep driver knows the values it used; the harness cannot
+    # introspect them, so it takes them on trust and writes them down.
+    parser.add_argument("--max-num-seqs", default="",
+                        help="Server's max_num_seqs, recorded in the summary.")
+    parser.add_argument("--max-num-batched-tokens", default="",
+                        help="Server's max_num_batched_tokens, recorded in the summary.")
+    parser.add_argument("--prefix-caching", choices=["on", "off", "unknown"],
+                        default="unknown",
+                        help="Whether the server ran with prefix caching enabled.")
     args = parser.parse_args()
+
+    started = datetime.now(timezone.utc)
+    run_id = started.strftime("%Y%m%dT%H%M%SZ")
 
     prompt = DEFAULT_PROMPT
     if args.prompt_file:
@@ -173,6 +256,8 @@ async def main():
             summaries.append(summary)
             for i, r in enumerate(all_results):
                 csv_rows.append({
+                    "run_id": run_id,
+                    "label": args.label,
                     "concurrency": concurrency,
                     "round": i // concurrency,
                     "ttft": r["ttft"],
@@ -182,15 +267,35 @@ async def main():
                     "tokens_per_sec": r["tokens_per_sec"],
                 })
     finally:
-        # Without an explicit close, asyncio.run() tears the loop down while the
-        # client's pooled httpcore connections are still open, producing noisy
-        # (harmless) GeneratorExit tracebacks on interpreter shutdown.
+        # Release pooled connections deterministically rather than leaving them
+        # to interpreter shutdown. This is hygiene, not a fix for the teardown
+        # traceback -- see _silence_asyncgen_teardown_noise().
         await client.close()
 
     print()
     print_summary_table(summaries)
     write_csv(args.output_csv, csv_rows)
+
+    summary_rows = [
+        {
+            "run_id": run_id,
+            "timestamp": started.isoformat(timespec="seconds"),
+            "label": args.label,
+            "model": args.model,
+            "max_num_seqs": args.max_num_seqs,
+            "max_num_batched_tokens": args.max_num_batched_tokens,
+            "prefix_caching": args.prefix_caching,
+            "rounds": args.rounds,
+            "warmup_rounds": args.warmup_rounds,
+            "max_tokens": args.max_tokens,
+            **sm,
+        }
+        for sm in summaries
+    ]
+    append_summary_csv(args.summary_csv, summary_rows)
+
     print(f"\nRaw per-request results written to {args.output_csv}")
+    print(f"Summary rows appended to {args.summary_csv} (run_id={run_id}, label={args.label or '-'})")
 
 
 if __name__ == "__main__":
