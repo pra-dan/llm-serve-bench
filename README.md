@@ -62,6 +62,8 @@ The gain diminishes steadily from conc=32 and collapses at 256; No sharp knee an
 
 > BTW, p50 is also the median - the typical experience as half the requests were faster than this and the other half were slower. Also, p99 only the slowest 1% were worst than this.
 
+We still don't know why throughput capped or why did TTFT go up? Or is the tail pulling away from the median? Before trying to answer this, I had to find out whether the numebrs are real.
+
 # Ch 2 - Are these numbers reliable/usable?
 Not fully. By default, vLLM enables/allows prefix caching. The server logs mentioned `Prefix cache hit rate: 68.3%`. So most of my prefill was being skipped! So I re-ran with `--no-enable-prefix-caching` but the numbers barely moved. 
 
@@ -112,6 +114,8 @@ The only change was observed in throughput at higher conc levels (128 and 256). 
 | 128 | 184.0 ± 2.9 | 191.9 ± 3.0 | +4.3% | +2.6 |
 | 256 | 344.5 ± 7.0 | 358.7 ± 7.1 | +4.1% | +2.0 |
 
+![Effect of prefix-caching](plots/03_prefix_caching.png)
+
 The effect of prefix caching can be seen for conc=128 & 256. It wins on both throughput (+4.3%, +3.3%) and TTFT (+4.3%, +4.1%). For the remaining smaller conc levels, the changes are still within the noise/std. This brings us to `max_num_batched_tokens`.
 
 > `max_num_batched_tokens=2048` is the per-step token budget i.e., the max number of tokens vLLM will push thorugh a single forward paass of the model. 
@@ -125,7 +129,48 @@ Cached blocks are skipped in the forward pass. More caching -> more budget saved
 
 So caching gave 3.3x higher admission rate! But this is worth nothing until admission is the bottleneck - we are still untouched by this.
 
-**Takeaway:** to actually measure prefix caching's effect, I need a longer shared prefix (a 500 to 2k token prompt), not a 46 one.
+## Takeaway 1:
+ to actually measure prefix caching's effect, I need a longer shared prefix (a 500 to 2k token prompt), not a 46 one.
+
+## Takeaway 2:
+Montoring uncovers something. 
+
+> ## Monitoring
+> vLLM already exports the metrics. So I set up Prometheus+Grafana. I start with the [official boilerplate](https://github.com/vllm-project/vllm/blob/main/examples/observability/prometheus_grafana/grafana.json) dashboard of vLLM. 
+> 
+> For inter-conc levels, I use the csv. For analysing a single conc level, I use vLLM metrics, i.e via Grafana.
+> 
+> All the metrics can be found at `http://localhost:9090/api/v1/label/__name__/values`. 
+
+Once Prometheus was scraping, I could compare the harness against vLLM's own numbers on the same conc=256 run:
+
+| | vLLM reports | harness measures | gap |
+|---|--:|--:|--:|
+| TTFT | 222.2 ms | 620.4 ms | **2.8x** |
+| ITL | 18.6 ms | 29.5 ms | 1.6x |
+| end-to-end | 2578.0 ms | 4753.8 ms | 1.8x |
+
+> [to be moved to appendix] How did we get this table?
+> All six came from a single conc=256 run (label promql-check, --rounds 4 --warmup-rounds 1, 1024 requests, prefix caching off).
+>
+> vLLM column — Prometheus queries of the form rate(..._sum[w]) / rate(..._count[w]), which gives an exact mean independent of bucket boundaries (the reason for not using histogram_quantile here is that vLLM's timing histograms start at le="0.3", far too coarse for millisecond latencies):
+>
+>value	query
+>222.2 ms	rate(vllm:time_to_first_token_seconds_sum[3m]) / rate(vllm:time_to_first_token_seconds_count[3m])
+>18.6 ms	rate(vllm:inter_token_latency_seconds_sum[3m]) / rate(vllm:inter_token_latency_seconds_count[3m])
+>2578.0 ms	rate(vllm:e2e_request_latency_seconds_sum[2m]) / rate(vllm:e2e_request_latency_seconds_count[2m])
+>
+>Harness column — computed from that run's raw per-request CSV and summary row:
+>value	source
+>620.4 ms	statistics.mean(ttft) over the 1024 raw rows
+>4753.8 ms	statistics.mean(total_time) over the same rows
+>29.5 ms	itl_p50 from the summary row
+>
+---
+
+About 400ms of TTFT per request is spent outside vLLM. The potential suspect is the harness itself. I thought this: vLLM parses 256 concurrent streams in one asyncio event loop, which is single-threaded, so ~8700 token-events/sec go through one core. This PC has 40 cores and load average sat at 2.66 - consistent with one core pinned, not forty busy. (I need to confirm this again by explicitly sampling the python process's CPU% during a conc=256 run) 
+
+In other words, the numbers in chapter 1 are what an API consumer over HTTP would experience and not what the GPU does. I think its safe to generalise and say that **at high concurrency, such a workload is partly client-bound.** (Worth knowing before blaming the GPU for everything!)
 
 # Ch 3 - So did preemption happen or not?
 
@@ -137,22 +182,59 @@ Looking at the (p99/p50) tail again, we notice that the ratio stayed in [1.14, 1
 |---|--:|--:|--:|--:|--:|--:|
 | p99/p50 | 1.14 | 1.26 | 1.31 | 1.22 | 1.43 | 1.50 |
 
+Visually, this is clearer.
+
+![TTFT percentiles](plots/02_ttft_tail.png)
+
 This indicates the entire distribution is sliding towards right (the p50 and p99 staying comparable). This flatness hints at absence of preemption but we can even figure it ourselves using KV arithmetic and the `config.json` from the model's HF page/repo. 
+
+The KV arithmetic says the same thing independently. 
 
 Per-token KV cost here:
 ```
 2 (i.e K and V heads) x 24 layers x 2 kv_heads x 64 head_dim x 2 bytes (bcoz fp16) = 12,299 B = 12 KiB/token
 ```
 
-Note that this model uses grouped-query attention (GQA) and not multi-head attention (MHA). Also, the model is 4-bit quantizied (AWQ) but the KV cache is not - it stays fp16 by default.
+Note that this model uses grouped-query attention (GQA) (2 KV heads, not 14) and not multi-head attention (MHA). Also, the model is 4-bit quantizied (AWQ) but the KV cache is not - it stays fp16 by default - interestingly, quantising weights does nothing for KV.
 
 Even though our prompt led to 46 tokens, the average generation length is capped by min(46, `--max-tokens=128`). The KV cache stored is prompt+generated = 46+128 = 174 tokens. This is rounded off to 176 by the 16-token blocks. 
 
-These 176 tokens cost ~2MiB. At conc=256, KV Cache would cost ~512MiB, against ~1.7GiB of max allowed KV space - over 3x headroom.
+These 176 tokens cost ~2MiB. At conc=256, KV Cache would cost ~512MiB, against ~1.7GiB of max allowed KV space - over 3x headroom. vLLM reports its own capacity as `kv_cache_size_tokens=135200`, so:
+
+```
+256 seqs x 176 tokens = 45,056 tokens needed  =  33.3% of capacity
+```
 
 Even the server logs were used to confirm no preemption. We get these numbers by polling the server's Prometheus metrics endpoint, `http://localhost:8000/metrics`. `vllm:num_preemptions_total` was **0** at every sample. KV usage peaks at **32.5%**. Preemption is ruled out by measurement, not by argument.
 
+So now we know answer to one of the question left at the end of chapter 1 (Is the tail drifing?). The tail is not pulling away, and nothing is being evicted. At higher conc level, all requests are waiting longer. The `running` topping out at exactly 256, which is `max_num_seqs` and requests queueing with `reason="capacity"` pointed somewhere else.
 
-# Ch 4 - What's really happening?
+> **How vLLM tracks waiting requests.** The scheduler keeps two sets: requests *running*
+> (being computed this step) and requests *waiting*. Each step it tries to promote waiting
+> requests into running, and when it can't, it records why. `vllm:num_requests_waiting`
+> is the total; `vllm:num_requests_waiting_by_reason` splits it by label, and this build
+> exposes two values - `capacity` and `deferred`.
+>
+> `capacity` means the scheduler tried to admit the request and had no room this step -
+> either no free sequence slot (`max_num_seqs`) or no token budget
+> (`max_num_batched_tokens`). `deferred` covers requests held back for other scheduler
+> reasons.
+>
+> The distinction that matters for the next section: **waiting at the door is not the same
+> as being thrown out of the room.** A waiting request has never started and has no KV
+> cache to lose. A preempted request was already generating and gets its KV cache
+> discarded. Both inflate latency; only one is preemption, and they have different
+> signatures.
 
-Saturation. vLLM keeps two sets of requests: *running* (being worked on this step) and requests *waiting*. In each step, it tries to promote waiting requests into running and if it can't, it records why.
+
+# Ch 4 - Is it admission queueing then?
+
+In Chapter, I mentioned "caching gave 3.3x higher admission rate". 
+
+> Also note `throughput = conc / ITL`, 
+
+# Ch 5 - 
+
+
+
+
