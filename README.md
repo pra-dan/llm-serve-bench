@@ -118,7 +118,7 @@ The only change was observed in throughput at higher conc levels (128 and 256). 
 
 The effect of prefix caching can be seen for conc=128 & 256. It wins on both throughput (+4.3%, +3.3%) and TTFT (+4.3%, +4.1%). For the remaining smaller conc levels, the changes are still within the noise/std. This brings us to `max_num_batched_tokens`.
 
-> `max_num_batched_tokens=2048` is the per-step token budget i.e., the max number of tokens vLLM will push thorugh a single forward paass of the model. 
+> `max_num_batched_tokens=2048` is the per-step token budget i.e., the max number of tokens vLLM will push through a single forward paass of the model. 
 
 Cached blocks are skipped in the forward pass. More caching -> more budget saved for requests -> more requests admitted.
 
@@ -229,12 +229,67 @@ So now we know answer to one of the question left at the end of chapter 1 (Is th
 
 # Ch 4 - Is it admission queueing then?
 
-In Chapter, I mentioned "caching gave 3.3x higher admission rate". 
+In Chapter, I mentioned "caching gave 3.3x higher admission rate". Its true that enabling prefix caching allows higher admission rate but is admission even the bottleneck? Apparently not.
 
-> Also note `throughput = conc / ITL`, 
+The metric `vllm:iteration_tokens_total` helps here - it is a histogram of tokens processed per scheduler step. If the budget was the bottleneck here, steps would cluster at 2048 (given that default `max_num_batched_tokens=2048`).
 
-# Ch 5 - 
+> budget vs. admission rate
+> The budget is slang for `max_num_batched_tokens` - the max tokens/work vLLM is ready to take per step, while admission rate is how fast we feed it tokens.
 
+If I launch 256 concurrent requests, the Grafana plot for scheduler steps looks like:
+![histogram](plots/04_scheduler_steps_histogram.png)
+
+X-axis: tokens processed in one scheduler step.
+Y-axis: number of steps.
+
+Of 879 steps, 741 (84%) processed 128-256 tokens. These gotta be decode steps (one token per running sequence with ~256 sequences running.) The small lcuster at 512-4096 (6+32+10= 48 steps, ~5%) is prefill: the start of each round.
+
+Total prefill needed = 256 * 46 = 11776 tokens
+budget per step = 2048 tokens
+min steps to admit all 256 = 11766 / 2048 = 5.76
+
+Ideally, we should see 5.76 bar above [1024, 2048] as prefill but instead, it gets spread across [512, 1024, 2048, 4096]. This can be because bulk of the steps are partially-filled prefill steps. Why, I would ignore that for now as we wanted to know whether most of the steps hit the admission budget and if that could be a bottleneck and clearly, its not. 
+
+> The histogram PromQL was `sum by (le) (increase(vllm:iteration_tokens_total_bucket[$__range]))` and the plot was kept as Histogram.
+
+This is also reflected by the server-side timings. On the same conc=256 run, 
+
+| phase | mean | query |
+|---|--|--|
+| queue | **2.1 ms** | rate(vllm:request_queue_time_seconds_sum[2m]) / rate(vllm:request_queue_time_seconds_count[2m]) |
+| prefill | 52.9 ms | rate(vllm:request_prefill_time_seconds_sum[2m]) / rate(vllm:request_prefill_time_seconds_count[2m]) | 
+| inference (prefill+decode) | 2414.8 ms | rate(vllm:request_inference_time_seconds_sum[2m]) / rate(vllm:request_inference_time_seconds_count[2m]) |
+| e2e | 2578.0 ms | rate(vllm:e2e_request_latency_seconds_sum[2m]) / rate(vllm:e2e_request_latency_seconds_count[2m]) |
+
+Queue time is **2.1ms out of 2578**. i.e., requests are admitted almost instantly and then spend 2362ms decoding.
+
+Lets look at decode now.
+
+# Ch 5 - It was Decode all along
+
+We already saw the numbers in the first chapter how throughput saturated over conc levels > 128. Its plot says this even clearly.
+![throuput vs. conc](plots/01_saturation.png)
+
+Interestingly, the througput can be computed using 
+```
+throughput = conc / ITL
+```
+
+So high conc *should* correspond (linearly) to high throughput unless ITL pulls it down.
+
+| conc | 1 | 8 | 32 | 64 | 128 | 256 |
+|---|--:|--:|--:|--:|--:|--:|
+| ITL p50 (ms) | 7.9 | 9.1 | 8.6 | 9.2 | 10.9 | **18.2** |
+
+Till conc=64, ITL stays flat but then batch grows 4x but ITL goes up too (2x), hence bringing down throughput - Each decode step costs more as the batch gets bigger.
+
+<TBD> Why decode got slower?
+
+
+# Ch 6 - Brushing off `max_num_sweeps` quickly
+While I was exploring `max_num_sweeps`, I wanted to know where it belongs in all this effort. Simply put, it is vLLM's cap on batch / conc. Until now, we had the default value of 256, which also coincides with our max conc level. As a result, vLLM never tried to chop our batch. But when would it do something like that?
+
+Our current harness is a closed loop system - we are monitoring for an explicit conc level. Whereas in more common open-loop systems, conc could have a large range. So vLLM uses the knob `max_num_sweeps` to control latency. It serializes the same work - smaller batches, longer queues, lower throughput. 
 
 
 
