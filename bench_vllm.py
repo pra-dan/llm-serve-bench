@@ -19,7 +19,7 @@ DEFAULT_PROMPT = (
 )
 
 
-async def run_single_request(client, model, prompt, max_tokens):
+async def run_single_request(client, model, prompt, max_tokens, ignore_eos=False):
     start = time.perf_counter()
     first_token_time = None
     last_token_time = None
@@ -32,6 +32,10 @@ async def run_single_request(client, model, prompt, max_tokens):
         max_tokens=max_tokens,
         stream=True,
         stream_options={"include_usage": True},
+        # vLLM extension: keep generating past EOS so every request really emits
+        # max_tokens. Without it, max_tokens is only a cap and the model stops
+        # wherever the prompt's natural answer ends.
+        extra_body={"ignore_eos": True} if ignore_eos else None,
     )
 
     async for chunk in stream:
@@ -68,10 +72,10 @@ async def run_single_request(client, model, prompt, max_tokens):
     }
 
 
-async def run_batch(client, model, prompt, max_tokens, concurrency):
+async def run_batch(client, model, prompt, max_tokens, concurrency, ignore_eos=False):
     batch_start = time.perf_counter()
     results = await asyncio.gather(
-        *[run_single_request(client, model, prompt, max_tokens) for _ in range(concurrency)]
+        *[run_single_request(client, model, prompt, max_tokens, ignore_eos) for _ in range(concurrency)]
     )
     batch_time = time.perf_counter() - batch_start
     return results, batch_time
@@ -85,15 +89,16 @@ def percentile(values, p):
     return s[idx]
 
 
-async def bench_concurrency(client, model, prompt, max_tokens, concurrency, rounds, warmup_rounds):
+async def bench_concurrency(client, model, prompt, max_tokens, concurrency, rounds, warmup_rounds,
+                            ignore_eos=False):
     for _ in range(warmup_rounds):
-        await run_batch(client, model, prompt, max_tokens, concurrency)
+        await run_batch(client, model, prompt, max_tokens, concurrency, ignore_eos)
 
     all_results = []
     total_tokens = 0
     total_wall_time = 0.0
     for _ in range(rounds):
-        results, batch_time = await run_batch(client, model, prompt, max_tokens, concurrency)
+        results, batch_time = await run_batch(client, model, prompt, max_tokens, concurrency, ignore_eos)
         all_results.extend(results)
         total_tokens += sum(r["completion_tokens"] for r in results)
         total_wall_time += batch_time
@@ -149,7 +154,7 @@ def write_csv(path, all_rows):
 SUMMARY_FIELDS = [
     "run_id", "timestamp", "label", "model",
     "max_num_seqs", "max_num_batched_tokens", "prefix_caching",
-    "rounds", "warmup_rounds", "max_tokens",
+    "rounds", "warmup_rounds", "max_tokens", "ignore_eos",
     "concurrency", "n_requests", "n_ttft_samples",
     "ttft_p50", "ttft_p90", "ttft_p99",
     "itl_p50", "itl_p90", "itl_p99",
@@ -232,6 +237,8 @@ async def main():
     parser.add_argument("--prefix-caching", choices=["on", "off", "unknown"],
                         default="unknown",
                         help="Whether the server ran with prefix caching enabled.")
+    parser.add_argument("--ignore-eos", action="store_true",
+                        help="Generate exactly --max-tokens per request (vLLM ignore_eos).")
     args = parser.parse_args()
 
     started = datetime.now(timezone.utc)
@@ -251,7 +258,8 @@ async def main():
         for concurrency in concurrency_levels:
             print(f"\n== concurrency={concurrency} ==")
             summary, all_results = await bench_concurrency(
-                client, args.model, prompt, args.max_tokens, concurrency, args.rounds, args.warmup_rounds
+                client, args.model, prompt, args.max_tokens, concurrency, args.rounds, args.warmup_rounds,
+                args.ignore_eos,
             )
             summaries.append(summary)
             for i, r in enumerate(all_results):
@@ -288,6 +296,7 @@ async def main():
             "rounds": args.rounds,
             "warmup_rounds": args.warmup_rounds,
             "max_tokens": args.max_tokens,
+            "ignore_eos": args.ignore_eos,
             **sm,
         }
         for sm in summaries
