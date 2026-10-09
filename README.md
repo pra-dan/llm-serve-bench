@@ -343,10 +343,8 @@ I learnt that the server counter i.e `vllm:num_preemptions_total` is the only in
 # Conclusion
 What I'd check first next time:
 
-- Whether prefix caching is on. vLLM enables it by default, and with one fixed prompt my first
-  runs were partly cached.
-- Whether the client is the bottleneck. Watch the load generator's CPU and whether vLLM's
-  engine is actually busy.
+- Whether prefix caching is on. vLLM enables it by default, and with one fixed prompt my first runs were partly cached.
+- Whether the client is the bottleneck. Watch the load generator's CPU and whether vLLM's engine is actually busy.
 - How many samples sit behind a percentile. My p99 at conc=1 and 8 was just the max.
 - What the server already reports. `vllm:num_preemptions_total` was the only thing that caught
   preemption; my client-side numbers never showed it.
