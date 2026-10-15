@@ -7,6 +7,9 @@ __pycache__/
 csv
 temp.md 
 *.csv
+temp
+CLAUDE.md
+week2_plan.md
 
 # C extensions
 *.so
