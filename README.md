@@ -220,6 +220,26 @@ These 176 tokens cost ~2MiB. At conc=256, KV Cache would cost ~512MiB, against ~
 256 seqs x 176 tokens = 45,056 tokens needed  =  33.3% of capacity
 ```
 
+> **Capacity vs usage.** `kv_cache_size_tokens` is the *capacity*: the size of the KV pool
+> vLLM reserves at startup (budget minus weights, profiling overhead and CUDA-graph memory).
+> It does not depend on the prompts and it does not change while serving. This is also why
+> `nvidia-smi` shows the GPU almost full while vLLM is idle.
+> *Usage* is what the running requests hold right now. Each request takes
+> `ceil((prompt + generated so far) / 16)` blocks, grows by one token per decode step, and
+> frees its blocks when it finishes. vLLM reports it as `vllm:kv_cache_usage_perc`.
+>
+> Memory arithmetic for this: budget − weights − overhead
+>
+> ```
+> usage ≈ running requests × ceil((prompt + generated) / 16) × 16
+> ```
+> **preemption starts when usage would exceed capacity**
+>
+> The startup line `Maximum concurrency for 4,096 tokens per request: 33.01x` is capacity ÷
+> `max_model_len`, the worst case where every request uses the full context. The real limit
+> is capacity ÷ the tokens each request actually uses: 135,200 ÷ 176 ≈ 768 requests here,
+> far above 256.
+
 Even the server's `/metrics` endpoint was used to confirm no preemption. We get these numbers by polling the server's Prometheus metrics endpoint, `http://localhost:8000/metrics`. `vllm:num_preemptions_total` was **0** at every sample. KV usage peaks at **32.5%**. Preemption is ruled out by measurement, not by argument.
 
 So now we know answer to one of the question left at the end of chapter 1 (Is the tail drifing?). The tail is not pulling away, and nothing is being evicted. At higher conc level, all requests are waiting longer. The `running` topping out at exactly 256, which is `max_num_seqs` and requests queueing with `reason="capacity"` pointed somewhere else.

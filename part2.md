@@ -1,8 +1,10 @@
 Let's make the benchmarking more realistic by 
 - using a bigger version of the model (0.5B -> 3B)
-- increasing the VRAM allowance 0.2 -> 0.9
+- increasing the VRAM allowance 0.2 -> 0.8
 - disabling eager-mode (so that cuda-graph fusion doesn't hide the latency)
 - using longer prompts. 
+
+This should lead to more realistic preemption.
 
 > As a reminder, this benchmark is on a 4070Ti (12GiB) but this time, the driver has been updated from 580.173 to 595.99.
 
@@ -50,12 +52,93 @@ So when would I use eager mode?
 2. For debugging: Early version of such inference systems can break and debugging each kernel is only possible when all of them are loaded. 
 3. Space was between KV Cache and Graphs: Skipping graphs saves more space for KV Cache.
 
-## Moving to a bigger model
-Let's create a baseline for the new (bigger) model. I wanted to calculat the KV cache size this time:
-```
-KV bytes  = util × total_memory − (weights + profiling overhead) − CUDA-graph estimate
-blocks    = floor(KV bytes / (block_size × KV bytes per token))
-kv_cache_size_tokens = blocks × 16          (when max_model_len is a multiple of 16)
+## Moving to a bigger model, testing out quants
+Let's create a baseline for the new (bigger) model. 
+```sh
+sudo nvidia-smi -pm 1 && sudo nvidia-smi -lgc 3105,3105
+
+vllm serve Qwen/Qwen2.5-3B-Instruct --dtype bfloat16 \
+ --max-model-len 4096 --gpu-memory-utilization 0.80 --no-enable-prefix-caching
+
+python3 bench_vllm.py --model Qwen/Qwen2.5-3B-Instruct \
+  --concurrency-levels 1,8,32,64,128,256 --output-csv csv/3B_baseline.csv
 ```
 
->  In week 1, we calculated the KV cost per token, which makes it clear that different models can have different cost per token. But isn't that different from what we are trying here?
+```
+conc  TTFT p50  TTFT p90  TTFT p99  ITL p50  ITL p90  req tok/s  agg tok/s
+---------------------------------------------------------------------------
+    1     30.7m     31.0m     31.0m    13.9m    13.9m       71.1       71.1
+    8     74.4m     77.5m     79.0m    14.3m    14.4m       67.7      539.9
+   32    175.9m    203.0m    218.5m    16.1m    16.3m       57.9     1833.8
+   64    339.0m    380.2m    408.3m    17.0m    18.2m       50.8     3199.5
+  128    459.9m    670.3m    730.3m    21.6m    23.0m       39.6     4967.2
+  256    821.8m   1273.6m   1323.6m    34.5m    37.4m       24.6     6135.9
+```
+
+**Note:** At conc=1 the GPU must read every weight from VRAM once for each new token. The ITL p50 from above table (13.9ms) is the min time required for a new token for our 3B model. But the floor is decided by the GPU bandwidth and varies with weights size. 
+For 3B weights, 6.17 / 504 GPps = 12.2ms
+So no token can come out faster than 12.2ms - the. This indicates that the extra 1.7ms is other work (preparing inputs, sampling, streaming to client, etc).
+For the previous, lighter 0.5B model, it was 2.07GiB -> ~4.1ms 
+i.e ~2.4x faster
+
+---
+
+## Predicting KV capacity
+We saw in previous part, how the KV Cache has a **Capacity** and the requests lead to **Usage**.
+I am going to do the arithmetic to predict and compare with vLLM logs.
+vLLM 0.28 computes the Capacity or `kv_cache_size_tokens` as:
+```py
+total_KV_bytes = util * avail_VRAM - weights - misc
+    = (0.8 * 11.589) - 6.17 - misc
+    = 3.1012 - misc
+    or under 3.1012 GiB
+
+    # avail RAM was found using `python -c "import torch; print(torch.cuda.mem_get_info()[1]/2**30)"`  (2**30 is num bytes in a GiB)
+    # misc is profiler overhead, cuda_graph mem, etc
+
+KV_bytes_per_token = 2 * hidden_layers * 2 KV_heads * 128 head_dim * 2
+    = 2 * 36 * 2 * 128 * 2
+    = 36,864 bytes
+    = 36 Kib
+
+    # this formula was computed in prev part (for 0.5B)
+    # head_dim = hidden_size / num_heads = 2048/16 = 128 but this is mostly specific to Qwen
+
+theoritical_max_tokens = total_KV_bytes / KV_bytes_per_token
+    = under 3.1012 GiB / 36 Kib per token
+    = 90329 tokens
+
+actual_max_token = max_blocks_allowed * 16
+    = floor(90329 / 16) * 16
+    = 90320
+```
+
+The GT is printed by vLLM when it starts:
+```sh
+(EngineCore pid=2304689) INFO 10-15 17:41:14 [kv_cache_utils.py:1869] GPU KV cache size: 87,552 tokens, ...
+```
+So we were close!
+
+## 4-bit weights: bf16 vs AWQ vs GPTQ
+
+I want to try three variants of this model and test against my quant!
+
+| Run | Weights | KV cache |
+|---|---|---|
+| `Qwen/Qwen2.5-3B-Instruct` | bf16 — **not quantised. (baseline)** | bf16 |
+| `Qwen/Qwen2.5-3B-Instruct-AWQ` | 4-bit (AWQ) | 16-bit |
+| `Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4` | 4-bit (GPTQ) | 16-bit |
+| baseline + `--kv-cache-dtype fp8` | bf16 | **FP8** |
+| FP8-dynamic checkpoint you make | FP8 weights and FP8 activations | bf16 |
+
+> **GPTQ vs. AWQ**
+> | Aspect | GPTQ | AWQ | 
+> |---|---|---|
+> | Core | Focuses on a layer-by-layer optimization process | Uses an activation-aware approach, targeting weights based on sensitivity |
+> | Memory savings | high | high |
+> | Accuracy | good for standard tasks | good for complex tasks |
+> | Calibration | Moderate | Extensive |
+> | Processing Time | Lower | Higher | 
+> I picked this from [the newline blog](https://www.newline.co/@zaoyang/gptq-vs-awq-quantization--d792476e).
+
+---
