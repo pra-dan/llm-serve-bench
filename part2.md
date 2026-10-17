@@ -6,7 +6,7 @@ Let's make the benchmarking more realistic by
 
 This should lead to more realistic preemption.
 
-> As a reminder, this benchmark is on a 4070Ti (12GiB) but this time, the driver has been updated from 580.173 to 595.99.
+> As a reminder, this benchmark is on a 4070Ti (12,282 MiB; PyTorch sees 11.59 GiB) but this time, the driver has been updated from 580.173 to 595.99.
 
 ## Eliminating first suspect - overhead:
 Each decode step has two costs:
@@ -76,10 +76,10 @@ conc  TTFT p50  TTFT p90  TTFT p99  ITL p50  ITL p90  req tok/s  agg tok/s
 ```
 
 **Note:** At conc=1 the GPU must read every weight from VRAM once for each new token. The ITL p50 from above table (13.9ms) is the min time required for a new token for our 3B model. But the floor is decided by the GPU bandwidth and varies with weights size. 
-For 3B weights, 6.17 / 504 GPps = 12.2ms
+For 3B weights, 5.75 GiB / 469 GiB/s = 12.2ms (same as 6.17 GB / 504 GB/s)
 So no token can come out faster than 12.2ms - the. This indicates that the extra 1.7ms is other work (preparing inputs, sampling, streaming to client, etc).
-For the previous, lighter 0.5B model, it was 2.07GiB -> ~4.1ms 
-i.e ~2.4x faster
+For the 4-bit (AWQ) 3B, weights are 1.93 GiB -> floor 1.93 / 469 = 4.1ms. Adding the same 1.7ms of other work gives ~5.8ms, i.e ~2.4x faster than 13.9ms.
+(For the previous, lighter 0.5B model, the floor was 0.43 GiB / 469 = 0.92ms.)
 
 ---
 
@@ -88,36 +88,38 @@ We saw in previous part, how the KV Cache has a **Capacity** and the requests le
 I am going to do the arithmetic to predict and compare with vLLM logs.
 vLLM 0.28 computes the Capacity or `kv_cache_size_tokens` as:
 ```py
-total_KV_bytes = util * avail_VRAM - weights - misc
-    = (0.8 * 11.589) - 6.17 - misc
-    = 3.1012 - misc
-    or under 3.1012 GiB
+total_KV_bytes = util * total_VRAM - weights - misc
+    = (0.8 * 11.589) - 5.75 - misc        # weights in GiB: 6.17 GB = 5.75 GiB
+    = 3.5212 - misc
+    or under 3.5212 GiB
 
-    # avail RAM was found using `python -c "import torch; print(torch.cuda.mem_get_info()[1]/2**30)"`  (2**30 is num bytes in a GiB)
+    # total VRAM was found using `python -c "import torch; print(torch.cuda.mem_get_info()[1]/2**30)"`  (2**30 is num bytes in a GiB)
     # misc is profiler overhead, cuda_graph mem, etc
 
 KV_bytes_per_token = 2 * hidden_layers * 2 KV_heads * 128 head_dim * 2
     = 2 * 36 * 2 * 128 * 2
     = 36,864 bytes
-    = 36 Kib
+    = 36 KiB
 
     # this formula was computed in prev part (for 0.5B)
     # head_dim = hidden_size / num_heads = 2048/16 = 128 but this is mostly specific to Qwen
 
 theoritical_max_tokens = total_KV_bytes / KV_bytes_per_token
-    = under 3.1012 GiB / 36 Kib per token
-    = 90329 tokens
+    = under 3.5212 GiB / 36 KiB per token
+    = under 102,562 tokens
 
 actual_max_token = max_blocks_allowed * 16
-    = floor(90329 / 16) * 16
-    = 90320
+    = floor(102562 / 16) * 16
+    = under 102,560
 ```
 
 The GT is printed by vLLM when it starts:
 ```sh
 (EngineCore pid=2304689) INFO 10-15 17:41:14 [kv_cache_utils.py:1869] GPU KV cache size: 87,552 tokens, ...
 ```
-So we were close!
+87,552 tokens x 36 KiB = 3.01 GiB, so misc = 3.52 - 3.01 = ~0.52 GiB. That is probably ~0.37 GiB of profiling overhead and ~0.15 GiB of CUDA-graph memory (the `VLLM_LOGGING_LEVEL=DEBUG` log shows the exact split).
+
+My first try looked even closer: 90,320 tokens. But it was close by luck. I subtracted the weights in GB (6.17) from a budget in GiB, which removed 0.42 GiB too much, and I ignored misc, which left 0.52 GiB in. The two errors almost cancelled.
 
 ## 4-bit weights: bf16 vs AWQ vs GPTQ
 
@@ -141,4 +143,15 @@ I want to try three variants of this model and test against my quant!
 > | Processing Time | Lower | Higher | 
 > I picked this from [the newline blog](https://www.newline.co/@zaoyang/gptq-vs-awq-quantization--d792476e).
 
----
+Both are 4-bit so comparing with the baseline BF16 weights, this is the difference I am expecting:
+- **Weight Footprint:** ~1.9GiB for each format, against 5.75 for bf16.
+- **KV Capacity:** With the freed memory, we get more KV capacity. (5.75 - 1.93) GiB x 29,127 = ~111k tokens. (29,127 as the bf16 model took 36,864 bytes per token i.e in 1Gib / 36,864 bytes = 29127 tokens). KV CACHE SAME???
+- **ITL at conc=1:** the floor drops from 12.2 to ~4.1 ms (2.07 GB / 504 GB/s); I use Gb instead of GiB as the bandwidth is given in GiB /s. The other ~1.7 ms of other per-step work exists. So we should expect ~5.8ms.
+- **At higher conc 32-64:** In the prev chapter, we mentioned throughput saturating for higher conc levels but left out the reason. This time, I'll just stick with the first logical tool: the roofline model. 
+- **AWQ vs. GPTQ:** Both use same kernel, so similar speed but quality can differ.
+
+```sh
+# serve AWQ first
+vllm serve Qwen/Qwen2.5-3B-Instruct-AWQ \
+    --max-model-len 4096 --gpu-memory-utilization 0.80 --no-enable-prefix-caching
+```

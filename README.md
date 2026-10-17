@@ -214,7 +214,7 @@ multi-head attention. That's a 7x smaller KV cache.
 
 Even though our prompt led to 46 tokens, the generation is capped at 128 (`--max-tokens=128`). The KV cache stored is prompt+generated = 46+128 = 174 tokens. This is rounded off to 176 by the 16-token blocks. 
 
-These 176 tokens cost ~2MiB. At conc=256, KV Cache would cost ~512MiB, against ~1.55GiB (instance budget=2.4 GB, weights took 0.43, so KV memory available=1.55GB) of max allowed KV space - over 3x headroom. vLLM reports its own capacity as `kv_cache_size_tokens=135200`, so:
+These 176 tokens cost ~2.06 MiB. At conc=256, KV cache would cost ~528 MiB, against ~1.55 GiB of KV space (budget 0.2 x 11.59 = 2.32 GiB, minus 0.43 GiB of weights and ~0.34 GiB of profiling overhead) - about 3x headroom. vLLM reports its own capacity as `kv_cache_size_tokens=135200`, so:
 
 ```
 256 seqs x 176 tokens = 45,056 tokens needed  =  33.3% of capacity
